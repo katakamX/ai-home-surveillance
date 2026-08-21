@@ -40,3 +40,12 @@ data/*
 !data/.gitkeep
 models/*
 !models/.gitkeep
+
+# Model weights, wherever they land. YOLO downloads into the working directory
+# if it is not given a path inside models/.
+*.pt
+*.onnx
+*.engine
+
+# Ultralytics run output
+runs/

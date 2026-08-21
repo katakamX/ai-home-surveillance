@@ -1,10 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "ai-home-surveillance"
 version = "0.1.0"
 description = "Modular AI home surveillance system, designed to run on both laptop and NVIDIA Jetson Nano."
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "opencv-python>=4.8.0",
+    "ultralytics>=8.0.0",
+    "python-dotenv>=1.0.0",
+]
 
+# The code is imported as src.camera, src.detection, ... so `src` is itself the
+# package. Discovery therefore starts at the project root, not inside src/.
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["."]
+include = ["src*"]

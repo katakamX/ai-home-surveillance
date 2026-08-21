@@ -1,5 +1,18 @@
+# Runtime dependencies:  pip install -r requirements.txt
+#
+# The unit tests need none of these -- they run on the standard library alone,
+# so there is no separate development requirements file yet.
+
+# Camera capture and window display.
 opencv-python>=4.8.0
 
-# Pulls in PyTorch automatically. On the Jetson, install the NVIDIA build of
-# PyTorch first, then install ultralytics with --no-deps.
+# YOLO detection. Installs PyTorch as a dependency (a large download).
 ultralytics>=8.0.0
+
+# Reads the .env file. Optional: the app falls back to plain environment
+# variables and built-in defaults when it is not installed.
+python-dotenv>=1.0.0
+
+# Jetson Nano note: do NOT install this file as-is on the device. JetPack ships
+# its own OpenCV, and PyTorch must be the NVIDIA aarch64 build. Install those
+# from NVIDIA first, then add ultralytics with --no-deps.
