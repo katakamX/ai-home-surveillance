@@ -1,1 +1,5 @@
-# Dependencies will be added as functionality is implemented.
+opencv-python>=4.8.0
+
+# Pulls in PyTorch automatically. On the Jetson, install the NVIDIA build of
+# PyTorch first, then install ultralytics with --no-deps.
+ultralytics>=8.0.0
