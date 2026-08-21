@@ -1,0 +1,10 @@
+[project]
+name = "ai-home-surveillance"
+version = "0.1.0"
+description = "Modular AI home surveillance system, designed to run on both laptop and NVIDIA Jetson Nano."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
