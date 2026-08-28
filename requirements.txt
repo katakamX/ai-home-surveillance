@@ -13,6 +13,12 @@ ultralytics>=8.0.0
 # variables and built-in defaults when it is not installed.
 python-dotenv>=1.0.0
 
+# Read-only HTTP API (src/api). uvicorn serves it: uvicorn src.api.app:app
+# The API tests skip themselves when these are not installed.
+fastapi>=0.110.0
+uvicorn>=0.27.0
+httpx>=0.27.0
+
 # Jetson Nano note: do NOT install this file as-is on the device. JetPack ships
 # its own OpenCV, and PyTorch must be the NVIDIA aarch64 build. Install those
 # from NVIDIA first, then add ultralytics with --no-deps.
