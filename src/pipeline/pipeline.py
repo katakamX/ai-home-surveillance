@@ -12,11 +12,13 @@ storage logic never leak into src.events.events.
         event_engine=event_engine,
         recorder_factory=lambda: VideoRecorder(data_dir / "events", fps=20.0, frame_size=(640, 480)),
         metadata_store=MetadataStore(StorageManager(data_dir / "events")),
+        alert_dispatcher=AlertDispatcher([ConsoleAlertHandler()]),
     )
     pipeline.run()
 
-The metadata_store is optional: without one the pipeline records exactly as
-it always did, it just writes no JSON.
+Both metadata_store and alert_dispatcher are optional: without them the
+pipeline records exactly as it always did, it just writes no JSON and
+notifies nobody.
 """
 
 import logging
@@ -25,6 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from src.alerts.alert import Alert, AlertDispatcher
 from src.camera.camera import Camera
 from src.detection.detector import Detector
 from src.events.events import EVENT_PERSON_ENTERED_ZONE, EVENT_PERSON_EXITED_ZONE, Event, EventEngine
@@ -43,6 +46,22 @@ RecorderFactory = Callable[[], VideoRecorder]
 
 # (track_id, zone_name): identifies one occupancy, and therefore one recording.
 RecordingKey = tuple[int, str]
+
+
+def _alert_for(event: Event) -> Alert:
+    """Describe one enter/exit event as an Alert.
+
+    EventEngine knows nothing about alerts, so the translation lives here.
+    """
+    verb = "entered" if event.event_type == EVENT_PERSON_ENTERED_ZONE else "left"
+    return Alert(
+        event_id=str(event.event_id),
+        event_type=event.event_type,
+        timestamp=event.timestamp,
+        zone=event.zone,
+        track_id=event.track_id,
+        message=f"{event.label} (track {event.track_id}) {verb} zone {event.zone}",
+    )
 
 
 @dataclass
@@ -74,6 +93,7 @@ class SurveillancePipeline:
         event_engine: EventEngine,
         recorder_factory: RecorderFactory,
         metadata_store: Optional[MetadataStore] = None,
+        alert_dispatcher: Optional[AlertDispatcher] = None,
     ) -> None:
         self.camera = camera
         self.detector = detector
@@ -81,6 +101,7 @@ class SurveillancePipeline:
         self.event_engine = event_engine
         self.recorder_factory = recorder_factory
         self.metadata_store = metadata_store
+        self.alert_dispatcher = alert_dispatcher
         self._recordings: dict[RecordingKey, _ActiveRecording] = {}
 
     def process_frame(
@@ -141,6 +162,22 @@ class SurveillancePipeline:
             recording = self._stop_recording(key)
             if recording is not None:
                 self._save_metadata(recording, event)
+
+        # Alerting comes last, so recording and metadata are already safe by
+        # the time anyone is notified.
+        self._send_alert(event)
+
+    def _send_alert(self, event: Event) -> None:
+        """Notify the alert dispatcher about one enter or exit event."""
+        if self.alert_dispatcher is None:
+            return
+
+        try:
+            self.alert_dispatcher.send(_alert_for(event))
+        except Exception:
+            # AlertDispatcher already isolates its handlers; this is the last
+            # line of defence so a notification can never stop surveillance.
+            logger.exception("Could not send alert for event %s", event.event_id)
 
     def _start_recording(self, key: RecordingKey, event: Event, frame: Frame) -> None:
         if key in self._recordings:

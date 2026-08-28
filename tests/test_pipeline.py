@@ -3,12 +3,14 @@ all mocks: this only checks the wiring, not any real detection/tracking/OpenCV
 behaviour (those already have their own test suites).
 """
 
+import io
 import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, call
 
+from src.alerts.alert import AlertDispatcher, ConsoleAlertHandler
 from src.events.events import EVENT_PERSON_ENTERED_ZONE, EVENT_PERSON_EXITED_ZONE, Event
 from src.pipeline.pipeline import SurveillancePipeline, build_recorder_factory
 from src.storage.metadata import MetadataError, MetadataStore
@@ -28,7 +30,9 @@ def make_event(event_type, track_id=1, zone="front_door", event_id=1, timestamp=
     )
 
 
-def make_pipeline(events_per_call=None, recorders=None, metadata_store=None):
+def make_pipeline(
+    events_per_call=None, recorders=None, metadata_store=None, alert_dispatcher=None
+):
     """Build a SurveillancePipeline with every dependency mocked.
 
     events_per_call: list of event-lists, one per process_frame() call, fed to
@@ -56,6 +60,7 @@ def make_pipeline(events_per_call=None, recorders=None, metadata_store=None):
         event_engine=event_engine,
         recorder_factory=recorder_factory,
         metadata_store=metadata_store,
+        alert_dispatcher=alert_dispatcher,
     )
     return pipeline, camera, detector, tracker, event_engine, recorder_factory
 
@@ -371,6 +376,9 @@ USE_REAL_STORE = object()
 
 PIPELINE_LOGGER = "src.pipeline.pipeline"
 
+# Marks "use the test case's own dispatcher", so None can mean "no alerts at all".
+USE_REAL_DISPATCHER = object()
+
 
 class MetadataIntegrationTestCase(unittest.TestCase):
     """Pipeline plus a real MetadataStore writing into a throwaway directory."""
@@ -530,6 +538,162 @@ class TestFailuresDoNotStopTheLoop(MetadataIntegrationTestCase):
 
         recorder.stop.assert_called_once()
         broken_store.save.assert_called_once()
+
+
+class AlertTestCase(unittest.TestCase):
+    """A pipeline with a real AlertDispatcher over a mocked handler."""
+
+    def setUp(self):
+        self.handler = MagicMock()
+        self.dispatcher = AlertDispatcher([self.handler])
+
+    def sent_alerts(self):
+        """Every Alert the handler received, in order."""
+        return [call_args.args[0] for call_args in self.handler.send.call_args_list]
+
+    def run_visit(self, dispatcher=USE_REAL_DISPATCHER, recorder=None):
+        """Drive one enter -> exit cycle through a pipeline with alerts on.
+
+        dispatcher defaults to this test case's own dispatcher; pass None to
+        build a pipeline with no dispatcher at all.
+        """
+        pipeline, *_rest = make_pipeline(
+            events_per_call=[
+                [make_event(EVENT_PERSON_ENTERED_ZONE, event_id=7, timestamp=100.0)],
+                [make_event(EVENT_PERSON_EXITED_ZONE, event_id=8, timestamp=112.5)],
+            ],
+            recorders=[recorder or make_recorder()],
+            alert_dispatcher=(
+                self.dispatcher if dispatcher is USE_REAL_DISPATCHER else dispatcher
+            ),
+        )
+        pipeline.process_frame("frame1")
+        pipeline.process_frame("frame2")
+        return pipeline
+
+
+class TestAlertsAreDispatched(AlertTestCase):
+    def test_enter_and_exit_each_dispatch_one_alert(self):
+        self.run_visit()
+
+        self.assertEqual(
+            [alert.event_type for alert in self.sent_alerts()],
+            [EVENT_PERSON_ENTERED_ZONE, EVENT_PERSON_EXITED_ZONE],
+        )
+
+    def test_enter_alert_carries_the_event_fields(self):
+        self.run_visit()
+
+        alert = self.sent_alerts()[0]
+
+        self.assertEqual(alert.event_id, "7")
+        self.assertEqual(alert.event_type, EVENT_PERSON_ENTERED_ZONE)
+        self.assertEqual(alert.timestamp, 100.0)
+        self.assertEqual(alert.zone, "front_door")
+        self.assertEqual(alert.track_id, 1)
+
+    def test_exit_alert_carries_the_exit_event_fields(self):
+        self.run_visit()
+
+        alert = self.sent_alerts()[1]
+
+        self.assertEqual(alert.event_id, "8")
+        self.assertEqual(alert.timestamp, 112.5)
+
+    def test_messages_describe_entering_and_leaving(self):
+        self.run_visit()
+
+        enter_alert, exit_alert = self.sent_alerts()
+
+        self.assertIn("entered", enter_alert.message)
+        self.assertIn("front_door", enter_alert.message)
+        self.assertIn("left", exit_alert.message)
+
+    def test_alerts_reach_a_real_console_handler(self):
+        stream = io.StringIO()
+        self.run_visit(dispatcher=AlertDispatcher([ConsoleAlertHandler(stream)]))
+
+        self.assertEqual(len(stream.getvalue().strip().splitlines()), 2)
+
+    def test_an_exit_without_a_recording_still_alerts(self):
+        pipeline, *_rest = make_pipeline(
+            events_per_call=[[make_event(EVENT_PERSON_EXITED_ZONE)]],
+            alert_dispatcher=self.dispatcher,
+        )
+
+        pipeline.process_frame("frame1")
+
+        self.assertEqual(len(self.sent_alerts()), 1)
+
+    def test_close_does_not_dispatch_alerts(self):
+        pipeline, *_rest = make_pipeline(
+            events_per_call=[[make_event(EVENT_PERSON_ENTERED_ZONE)]],
+            recorders=[make_recorder()],
+            alert_dispatcher=self.dispatcher,
+        )
+
+        pipeline.process_frame("frame1")
+        self.handler.send.reset_mock()
+        pipeline.close()
+
+        self.handler.send.assert_not_called()
+
+
+class TestPipelineWithoutADispatcher(AlertTestCase):
+    def test_recording_is_unchanged_when_no_dispatcher_is_given(self):
+        recorder = make_recorder()
+
+        self.run_visit(dispatcher=None, recorder=recorder)
+
+        recorder.start.assert_called_once()
+        recorder.stop.assert_called_once()
+        self.handler.send.assert_not_called()
+
+
+class TestAlertFailuresDoNotStopTheLoop(AlertTestCase):
+    """Alerting is best-effort: recording and metadata must survive it failing."""
+
+    def test_a_failing_handler_does_not_break_recording(self):
+        self.handler.send.side_effect = RuntimeError("handler down")
+        recorder = make_recorder()
+
+        with self.assertLogs("src.alerts.alert", level="ERROR"):
+            self.run_visit(recorder=recorder)
+
+        recorder.start.assert_called_once()
+        recorder.stop.assert_called_once()
+
+    def test_a_failing_dispatcher_does_not_break_recording_or_metadata(self):
+        broken_dispatcher = MagicMock()
+        broken_dispatcher.send.side_effect = RuntimeError("dispatcher exploded")
+        recorder = make_recorder()
+
+        with self.assertLogs(PIPELINE_LOGGER, level="ERROR"):
+            self.run_visit(dispatcher=broken_dispatcher, recorder=recorder)
+
+        recorder.start.assert_called_once()
+        recorder.stop.assert_called_once()
+
+    def test_a_failing_dispatcher_still_lets_metadata_be_saved(self):
+        broken_dispatcher = MagicMock()
+        broken_dispatcher.send.side_effect = RuntimeError("dispatcher exploded")
+        store = MagicMock()
+
+        pipeline, *_rest = make_pipeline(
+            events_per_call=[
+                [make_event(EVENT_PERSON_ENTERED_ZONE, event_id=7)],
+                [make_event(EVENT_PERSON_EXITED_ZONE, event_id=8)],
+            ],
+            recorders=[make_recorder()],
+            metadata_store=store,
+            alert_dispatcher=broken_dispatcher,
+        )
+
+        with self.assertLogs(PIPELINE_LOGGER, level="ERROR"):
+            pipeline.process_frame("frame1")
+            pipeline.process_frame("frame2")
+
+        store.save.assert_called_once()
 
 
 if __name__ == "__main__":
