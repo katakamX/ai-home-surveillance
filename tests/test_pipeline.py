@@ -3,17 +3,23 @@ all mocks: this only checks the wiring, not any real detection/tracking/OpenCV
 behaviour (those already have their own test suites).
 """
 
+import tempfile
 import unittest
+from datetime import datetime
+from pathlib import Path
 from unittest.mock import MagicMock, call
 
 from src.events.events import EVENT_PERSON_ENTERED_ZONE, EVENT_PERSON_EXITED_ZONE, Event
 from src.pipeline.pipeline import SurveillancePipeline, build_recorder_factory
+from src.storage.metadata import MetadataError, MetadataStore
+from src.storage.recorder import RecorderError
+from src.storage.storage_manager import StorageManager
 
 
-def make_event(event_type, track_id=1, zone="front_door", event_id=1):
+def make_event(event_type, track_id=1, zone="front_door", event_id=1, timestamp=100.0):
     return Event(
         event_id=event_id,
-        timestamp=100.0,
+        timestamp=timestamp,
         event_type=event_type,
         track_id=track_id,
         label="person",
@@ -22,7 +28,7 @@ def make_event(event_type, track_id=1, zone="front_door", event_id=1):
     )
 
 
-def make_pipeline(events_per_call=None, recorders=None):
+def make_pipeline(events_per_call=None, recorders=None, metadata_store=None):
     """Build a SurveillancePipeline with every dependency mocked.
 
     events_per_call: list of event-lists, one per process_frame() call, fed to
@@ -49,6 +55,7 @@ def make_pipeline(events_per_call=None, recorders=None):
         tracker=tracker,
         event_engine=event_engine,
         recorder_factory=recorder_factory,
+        metadata_store=metadata_store,
     )
     return pipeline, camera, detector, tracker, event_engine, recorder_factory
 
@@ -349,6 +356,180 @@ class TestBuildRecorderFactory(unittest.TestCase):
             factory()
 
             self.assertEqual(video_recorder_cls.call_count, 2)
+
+
+def make_recorder(video_path="video.mp4", snapshot_path="snap.jpg"):
+    """A recorder mock that reports the paths it wrote, like the real one does."""
+    recorder = MagicMock()
+    recorder.start.return_value = Path(video_path)
+    recorder.save_snapshot.return_value = Path(snapshot_path)
+    return recorder
+
+
+# Marks "use the test case's own store", so None can mean "no store at all".
+USE_REAL_STORE = object()
+
+PIPELINE_LOGGER = "src.pipeline.pipeline"
+
+
+class MetadataIntegrationTestCase(unittest.TestCase):
+    """Pipeline plus a real MetadataStore writing into a throwaway directory."""
+
+    def setUp(self):
+        self._temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp_dir.cleanup)
+        self.root_dir = Path(self._temp_dir.name) / "events"
+        self.store = MetadataStore(StorageManager(self.root_dir))
+
+        # Enter at 100.0, exit at 112.5: a 12.5 second visit.
+        self.enter_event = make_event(EVENT_PERSON_ENTERED_ZONE, event_id=7, timestamp=100.0)
+        self.exit_event = make_event(EVENT_PERSON_EXITED_ZONE, event_id=8, timestamp=112.5)
+        self.when = datetime.fromtimestamp(100.0)
+
+    def run_visit(self, recorder=None, store=USE_REAL_STORE):
+        """Drive one full enter -> record -> exit cycle and return the recorder.
+
+        store defaults to this test case's real MetadataStore; pass None to
+        build a pipeline with no metadata store at all.
+        """
+        recorder = recorder or make_recorder()
+        pipeline, *_rest = make_pipeline(
+            events_per_call=[[self.enter_event], [], [self.exit_event]],
+            recorders=[recorder],
+            metadata_store=self.store if store is USE_REAL_STORE else store,
+        )
+        pipeline.process_frame("frame1")
+        pipeline.process_frame("frame2")
+        pipeline.process_frame("frame3")
+        return recorder
+
+
+class TestCompletedEventMetadata(MetadataIntegrationTestCase):
+    def test_exit_saves_one_metadata_record(self):
+        self.run_visit()
+
+        self.assertEqual(len(self.store.list_all()), 1)
+
+    def test_metadata_describes_the_completed_visit(self):
+        self.run_visit()
+
+        record = self.store.load("7", self.when)
+
+        self.assertEqual(record.event_id, "7")
+        self.assertEqual(record.event_type, EVENT_PERSON_ENTERED_ZONE)
+        self.assertEqual(record.timestamp, 100.0)
+        self.assertEqual(record.track_id, 1)
+        self.assertEqual(record.label, "person")
+        self.assertEqual(record.zone, "front_door")
+        self.assertEqual(record.confidence, 0.9)
+
+    def test_duration_is_the_time_between_enter_and_exit(self):
+        self.run_visit()
+
+        self.assertEqual(self.store.load("7", self.when).duration, 12.5)
+
+    def test_metadata_records_the_recorder_paths(self):
+        self.run_visit(recorder=make_recorder("clip.mp4", "shot.jpg"))
+
+        record = self.store.load("7", self.when)
+
+        self.assertEqual(record.video_path, str(Path("clip.mp4")))
+        self.assertEqual(record.snapshot_path, str(Path("shot.jpg")))
+
+    def test_no_metadata_is_saved_before_the_exit_event(self):
+        pipeline, *_rest = make_pipeline(
+            events_per_call=[[self.enter_event], []],
+            recorders=[make_recorder()],
+            metadata_store=self.store,
+        )
+
+        pipeline.process_frame("frame1")
+        pipeline.process_frame("frame2")
+
+        self.assertEqual(self.store.list_all(), [])
+
+    def test_close_does_not_save_metadata_for_an_unfinished_visit(self):
+        pipeline, *_rest = make_pipeline(
+            events_per_call=[[self.enter_event]],
+            recorders=[make_recorder()],
+            metadata_store=self.store,
+        )
+
+        pipeline.process_frame("frame1")
+        pipeline.close()
+
+        self.assertEqual(self.store.list_all(), [])
+
+    def test_exit_without_a_matching_enter_saves_nothing(self):
+        pipeline, *_rest = make_pipeline(
+            events_per_call=[[self.exit_event]], metadata_store=self.store
+        )
+
+        pipeline.process_frame("frame1")
+
+        self.assertEqual(self.store.list_all(), [])
+
+    def test_pipeline_without_a_metadata_store_still_records(self):
+        recorder = self.run_visit(store=None)
+
+        recorder.start.assert_called_once()
+        recorder.stop.assert_called_once()
+        self.assertEqual(self.store.list_all(), [])
+
+
+class TestFailuresDoNotStopTheLoop(MetadataIntegrationTestCase):
+    """Every failure here is logged and swallowed: the surveillance loop keeps running.
+
+    assertLogs both checks that the failure was reported and keeps the
+    expected tracebacks out of the test output.
+    """
+
+    def test_failing_recorder_start_skips_the_visit_without_raising(self):
+        recorder = make_recorder()
+        recorder.start.side_effect = RecorderError("no disk")
+        pipeline, *_rest = make_pipeline(
+            events_per_call=[[self.enter_event], [self.exit_event]],
+            recorders=[recorder],
+            metadata_store=self.store,
+        )
+
+        with self.assertLogs(PIPELINE_LOGGER, level="ERROR"):
+            pipeline.process_frame("frame1")
+            pipeline.process_frame("frame2")
+
+        recorder.write.assert_not_called()
+        recorder.stop.assert_not_called()
+        self.assertEqual(self.store.list_all(), [])
+
+    def test_failing_snapshot_still_records_and_saves_metadata(self):
+        recorder = make_recorder()
+        recorder.save_snapshot.side_effect = RecorderError("bad frame")
+
+        with self.assertLogs(PIPELINE_LOGGER, level="ERROR"):
+            self.run_visit(recorder=recorder)
+
+        record = self.store.load("7", self.when)
+        self.assertIsNone(record.snapshot_path)
+        self.assertEqual(record.video_path, str(Path("video.mp4")))
+
+    def test_failing_recorder_stop_still_saves_metadata(self):
+        recorder = make_recorder()
+        recorder.stop.side_effect = RecorderError("cannot close")
+
+        with self.assertLogs(PIPELINE_LOGGER, level="ERROR"):
+            self.run_visit(recorder=recorder)
+
+        self.assertEqual(len(self.store.list_all()), 1)
+
+    def test_failing_metadata_save_does_not_raise(self):
+        broken_store = MagicMock()
+        broken_store.save.side_effect = MetadataError("disk full")
+
+        with self.assertLogs(PIPELINE_LOGGER, level="ERROR"):
+            recorder = self.run_visit(store=broken_store)  # should not raise
+
+        recorder.stop.assert_called_once()
+        broken_store.save.assert_called_once()
 
 
 if __name__ == "__main__":

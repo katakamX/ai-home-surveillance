@@ -1,9 +1,9 @@
 """Pipeline: wires Camera, Detector, Tracker, EventEngine and VideoRecorder together.
 
 EventEngine only ever sees TrackedObject data and emits Event objects; it has
-no idea recording exists. This module is the one place that turns those
-events into recordings, so OpenCV/VideoRecorder logic never leaks into
-src.events.events.
+no idea recording or metadata exists. This module is the one place that turns
+those events into recordings and metadata files, so OpenCV/VideoRecorder and
+storage logic never leak into src.events.events.
 
     pipeline = SurveillancePipeline(
         camera=camera,
@@ -11,18 +11,25 @@ src.events.events.
         tracker=tracker,
         event_engine=event_engine,
         recorder_factory=lambda: VideoRecorder(data_dir / "events", fps=20.0, frame_size=(640, 480)),
+        metadata_store=MetadataStore(StorageManager(data_dir / "events")),
     )
     pipeline.run()
+
+The metadata_store is optional: without one the pipeline records exactly as
+it always did, it just writes no JSON.
 """
 
 import logging
 import time
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from src.camera.camera import Camera
 from src.detection.detector import Detector
 from src.events.events import EVENT_PERSON_ENTERED_ZONE, EVENT_PERSON_EXITED_ZONE, Event, EventEngine
-from src.storage.recorder import VideoRecorder
+from src.storage.metadata import EventMetadata, MetadataError, MetadataStore
+from src.storage.recorder import RecorderError, VideoRecorder
 from src.tracking.tracker import Tracker, TrackedObject
 
 logger = logging.getLogger(__name__)
@@ -36,6 +43,20 @@ RecorderFactory = Callable[[], VideoRecorder]
 
 # (track_id, zone_name): identifies one occupancy, and therefore one recording.
 RecordingKey = tuple[int, str]
+
+
+@dataclass
+class _ActiveRecording:
+    """One in-progress zone visit: its recorder plus what the metadata will need.
+
+    Held from the enter event until the matching exit event, when it becomes
+    one completed EventMetadata record.
+    """
+
+    recorder: VideoRecorder
+    enter_event: Event
+    video_path: Optional[Path] = None
+    snapshot_path: Optional[Path] = None
 
 
 class SurveillancePipeline:
@@ -52,13 +73,15 @@ class SurveillancePipeline:
         tracker: Tracker,
         event_engine: EventEngine,
         recorder_factory: RecorderFactory,
+        metadata_store: Optional[MetadataStore] = None,
     ) -> None:
         self.camera = camera
         self.detector = detector
         self.tracker = tracker
         self.event_engine = event_engine
         self.recorder_factory = recorder_factory
-        self._recordings: dict[RecordingKey, VideoRecorder] = {}
+        self.metadata_store = metadata_store
+        self._recordings: dict[RecordingKey, _ActiveRecording] = {}
 
     def process_frame(
         self, frame: Frame, timestamp: Optional[float] = None
@@ -79,8 +102,8 @@ class SurveillancePipeline:
         for event in events:
             self._handle_event(event, frame)
 
-        for recorder in self._recordings.values():
-            recorder.write(frame)
+        for recording in self._recordings.values():
+            recording.recorder.write(frame)
 
         return tracked_objects, events
 
@@ -102,18 +125,24 @@ class SurveillancePipeline:
             self.close()
 
     def close(self) -> None:
-        """Stop every recording still in progress. Safe to call more than once."""
+        """Stop every recording still in progress. Safe to call more than once.
+
+        These visits never saw an exit event, so they are not complete and no
+        metadata is written for them.
+        """
         for key in list(self._recordings):
             self._stop_recording(key)
 
     def _handle_event(self, event: Event, frame: Frame) -> None:
         key = (event.track_id, event.zone)
         if event.event_type == EVENT_PERSON_ENTERED_ZONE:
-            self._start_recording(key, frame)
+            self._start_recording(key, event, frame)
         elif event.event_type == EVENT_PERSON_EXITED_ZONE:
-            self._stop_recording(key)
+            recording = self._stop_recording(key)
+            if recording is not None:
+                self._save_metadata(recording, event)
 
-    def _start_recording(self, key: RecordingKey, frame: Frame) -> None:
+    def _start_recording(self, key: RecordingKey, event: Event, frame: Frame) -> None:
         if key in self._recordings:
             # EventEngine reports at most one enter per (track, zone) between a
             # matching pair of enter/exit, so this should not happen. Guard
@@ -122,16 +151,68 @@ class SurveillancePipeline:
             return
 
         recorder = self.recorder_factory()
-        recorder.start()
-        recorder.save_snapshot(frame)
-        self._recordings[key] = recorder
+        try:
+            video_path = recorder.start()
+        except RecorderError:
+            # A camera visit we cannot record is not worth crashing the loop for.
+            logger.exception("Could not start recording for track=%s zone=%s", key[0], key[1])
+            return
+
+        recording = _ActiveRecording(recorder=recorder, enter_event=event, video_path=video_path)
+
+        try:
+            recording.snapshot_path = recorder.save_snapshot(frame)
+        except RecorderError:
+            # A missing snapshot is not fatal: keep recording video without it.
+            logger.exception("Could not save snapshot for track=%s zone=%s", key[0], key[1])
+
+        self._recordings[key] = recording
         logger.info("Recording started for track=%s zone=%s", key[0], key[1])
 
-    def _stop_recording(self, key: RecordingKey) -> None:
-        recorder = self._recordings.pop(key, None)
-        if recorder is not None:
-            recorder.stop()
-            logger.info("Recording stopped for track=%s zone=%s", key[0], key[1])
+    def _stop_recording(self, key: RecordingKey) -> Optional[_ActiveRecording]:
+        """Stop the recording for key and return it, or None if there was none."""
+        recording = self._recordings.pop(key, None)
+        if recording is None:
+            return None
+
+        try:
+            recording.recorder.stop()
+        except RecorderError:
+            # The clip may be truncated, but the visit still happened and is
+            # still worth describing in metadata.
+            logger.exception("Could not stop recording for track=%s zone=%s", key[0], key[1])
+
+        logger.info("Recording stopped for track=%s zone=%s", key[0], key[1])
+        return recording
+
+    def _save_metadata(self, recording: _ActiveRecording, exit_event: Event) -> None:
+        """Write one completed zone visit to the metadata store.
+
+        The record is identified by the enter event: it says "this person
+        entered this zone at this time and stayed for this long".
+        """
+        if self.metadata_store is None:
+            return
+
+        enter_event = recording.enter_event
+        metadata = EventMetadata(
+            event_id=str(enter_event.event_id),
+            event_type=enter_event.event_type,
+            timestamp=enter_event.timestamp,
+            track_id=enter_event.track_id,
+            label=enter_event.label,
+            zone=enter_event.zone,
+            confidence=enter_event.confidence,
+            duration=exit_event.timestamp - enter_event.timestamp,
+            video_path=str(recording.video_path) if recording.video_path else None,
+            snapshot_path=str(recording.snapshot_path) if recording.snapshot_path else None,
+        )
+
+        try:
+            self.metadata_store.save(metadata)
+        except MetadataError:
+            # Losing a JSON file must not take down a running surveillance loop.
+            logger.exception("Could not save metadata for event %s", metadata.event_id)
 
 
 def build_recorder_factory(
