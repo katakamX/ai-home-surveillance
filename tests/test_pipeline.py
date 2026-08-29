@@ -733,6 +733,62 @@ class TestActiveRecordingWriteFailures(unittest.TestCase):
         healthy_recorder.write.assert_called_with("frame2")
 
 
+class TestLifecycleLogging(unittest.TestCase):
+    def test_run_logs_pipeline_started_and_stopped(self):
+        pipeline, camera, *_rest = make_pipeline(events_per_call=[[]])
+        camera.read.side_effect = [(True, "frame1"), (False, None)]
+
+        with self.assertLogs(PIPELINE_LOGGER, level="INFO") as logs:
+            pipeline.run()
+
+        self.assertTrue(any("Pipeline started" in message for message in logs.output))
+        self.assertTrue(any("Pipeline stopped" in message for message in logs.output))
+
+    def test_run_logs_when_the_camera_stops_supplying_frames(self):
+        pipeline, camera, *_rest = make_pipeline(events_per_call=[[]])
+        camera.read.side_effect = [(True, "frame1"), (False, None)]
+
+        with self.assertLogs(PIPELINE_LOGGER, level="WARNING") as logs:
+            pipeline.run()
+
+        self.assertTrue(any("Camera stopped supplying frames" in message for message in logs.output))
+
+
+class TestEventLogging(unittest.TestCase):
+    def test_event_creation_is_logged_with_context(self):
+        pipeline, *_rest = make_pipeline(
+            events_per_call=[[make_event(EVENT_PERSON_ENTERED_ZONE, event_id=7, track_id=3, zone="backyard")]],
+            recorders=[make_recorder()],
+        )
+
+        with self.assertLogs(PIPELINE_LOGGER, level="INFO") as logs:
+            pipeline.process_frame("frame1")
+
+        self.assertTrue(
+            any(
+                "event_id=7" in message and "track=3" in message and "zone=backyard" in message
+                for message in logs.output
+            )
+        )
+
+    def test_completed_event_is_logged_with_duration(self):
+        store = MagicMock()
+        pipeline, *_rest = make_pipeline(
+            events_per_call=[
+                [make_event(EVENT_PERSON_ENTERED_ZONE, event_id=7, timestamp=100.0)],
+                [make_event(EVENT_PERSON_EXITED_ZONE, event_id=8, timestamp=112.5)],
+            ],
+            recorders=[make_recorder()],
+            metadata_store=store,
+        )
+
+        with self.assertLogs(PIPELINE_LOGGER, level="INFO") as logs:
+            pipeline.process_frame("frame1")
+            pipeline.process_frame("frame2")
+
+        self.assertTrue(any("Event completed" in message and "duration=12.50s" in message for message in logs.output))
+
+
 class TestAlertFailuresDoNotStopTheLoop(AlertTestCase):
     """Alerting is best-effort: recording and metadata must survive it failing."""
 

@@ -159,8 +159,14 @@ class SurveillancePipeline:
         for key, recording in self._recordings.items():
             try:
                 recording.recorder.write(frame)
-            except RecorderError:
-                logger.exception("Could not write frame for track=%s zone=%s", key[0], key[1])
+            except RecorderError as error:
+                logger.exception(
+                    "Could not write frame for event_id=%s track=%s zone=%s: %s",
+                    recording.enter_event.event_id,
+                    key[0],
+                    key[1],
+                    error,
+                )
 
     def run(self, max_frames: Optional[int] = None) -> None:
         """Read frames from the camera and process them until it runs dry.
@@ -168,16 +174,19 @@ class SurveillancePipeline:
         Stops after max_frames if given, otherwise runs until the camera stops
         returning frames. Always releases any recordings still open on exit.
         """
+        logger.info("Pipeline started")
         frames_read = 0
         try:
             while max_frames is None or frames_read < max_frames:
                 success, frame = self.camera.read()
                 if not success:
+                    logger.warning("Camera stopped supplying frames; stopping pipeline")
                     break
                 self.process_frame(frame)
                 frames_read += 1
         finally:
             self.close()
+            logger.info("Pipeline stopped")
 
     def close(self) -> None:
         """Stop every recording still in progress. Safe to call more than once.
@@ -189,6 +198,13 @@ class SurveillancePipeline:
             self._stop_recording(key)
 
     def _handle_event(self, event: Event, frame: Frame) -> None:
+        logger.info(
+            "Event created: event_id=%s type=%s track=%s zone=%s",
+            event.event_id,
+            event.event_type,
+            event.track_id,
+            event.zone,
+        )
         key = (event.track_id, event.zone)
         if event.event_type == EVENT_PERSON_ENTERED_ZONE:
             self._start_recording(key, event, frame)
@@ -211,7 +227,12 @@ class SurveillancePipeline:
         except Exception:
             # AlertDispatcher already isolates its handlers; this is the last
             # line of defence so a notification can never stop surveillance.
-            logger.exception("Could not send alert for event %s", event.event_id)
+            logger.exception(
+                "Could not send alert for event_id=%s track=%s zone=%s",
+                event.event_id,
+                event.track_id,
+                event.zone,
+            )
 
     def _start_recording(self, key: RecordingKey, event: Event, frame: Frame) -> None:
         if key in self._recordings:
@@ -224,21 +245,35 @@ class SurveillancePipeline:
         recorder = self.recorder_factory()
         try:
             video_path = recorder.start()
-        except RecorderError:
+        except RecorderError as error:
             # A camera visit we cannot record is not worth crashing the loop for.
-            logger.exception("Could not start recording for track=%s zone=%s", key[0], key[1])
+            logger.exception(
+                "Could not start recording for event_id=%s track=%s zone=%s: %s",
+                event.event_id,
+                key[0],
+                key[1],
+                error,
+            )
             return
 
         recording = _ActiveRecording(recorder=recorder, enter_event=event, video_path=video_path)
 
         try:
             recording.snapshot_path = recorder.save_snapshot(frame)
-        except RecorderError:
+        except RecorderError as error:
             # A missing snapshot is not fatal: keep recording video without it.
-            logger.exception("Could not save snapshot for track=%s zone=%s", key[0], key[1])
+            logger.exception(
+                "Could not save snapshot for event_id=%s track=%s zone=%s: %s",
+                event.event_id,
+                key[0],
+                key[1],
+                error,
+            )
 
         self._recordings[key] = recording
-        logger.info("Recording started for track=%s zone=%s", key[0], key[1])
+        logger.info(
+            "Recording started: event_id=%s track=%s zone=%s", event.event_id, key[0], key[1]
+        )
 
     def _stop_recording(self, key: RecordingKey) -> Optional[_ActiveRecording]:
         """Stop the recording for key and return it, or None if there was none."""
@@ -246,14 +281,21 @@ class SurveillancePipeline:
         if recording is None:
             return None
 
+        event_id = recording.enter_event.event_id
         try:
             recording.recorder.stop()
-        except RecorderError:
+        except RecorderError as error:
             # The clip may be truncated, but the visit still happened and is
             # still worth describing in metadata.
-            logger.exception("Could not stop recording for track=%s zone=%s", key[0], key[1])
+            logger.exception(
+                "Could not stop recording for event_id=%s track=%s zone=%s: %s",
+                event_id,
+                key[0],
+                key[1],
+                error,
+            )
 
-        logger.info("Recording stopped for track=%s zone=%s", key[0], key[1])
+        logger.info("Recording stopped: event_id=%s track=%s zone=%s", event_id, key[0], key[1])
         return recording
 
     def _save_metadata(self, recording: _ActiveRecording, exit_event: Event) -> None:
@@ -266,6 +308,7 @@ class SurveillancePipeline:
             return
 
         enter_event = recording.enter_event
+        duration = exit_event.timestamp - enter_event.timestamp
         metadata = EventMetadata(
             event_id=str(enter_event.event_id),
             event_type=enter_event.event_type,
@@ -274,16 +317,30 @@ class SurveillancePipeline:
             label=enter_event.label,
             zone=enter_event.zone,
             confidence=enter_event.confidence,
-            duration=exit_event.timestamp - enter_event.timestamp,
+            duration=duration,
             video_path=str(recording.video_path) if recording.video_path else None,
             snapshot_path=str(recording.snapshot_path) if recording.snapshot_path else None,
         )
 
         try:
             self.metadata_store.save(metadata)
-        except MetadataError:
+        except MetadataError as error:
             # Losing a JSON file must not take down a running surveillance loop.
-            logger.exception("Could not save metadata for event %s", metadata.event_id)
+            logger.exception(
+                "Could not save metadata for event_id=%s track=%s zone=%s: %s",
+                metadata.event_id,
+                metadata.track_id,
+                metadata.zone,
+                error,
+            )
+        else:
+            logger.info(
+                "Event completed: event_id=%s track=%s zone=%s duration=%.2fs",
+                metadata.event_id,
+                metadata.track_id,
+                metadata.zone,
+                duration,
+            )
 
 
 def build_recorder_factory(

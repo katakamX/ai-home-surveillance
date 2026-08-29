@@ -95,7 +95,13 @@ class MetadataStore:
         except OSError as error:
             raise MetadataError(f"Could not write metadata to {path}") from error
 
-        logger.info("Metadata saved: %s", path)
+        logger.info(
+            "Metadata saved: event_id=%s track=%s zone=%s path=%s",
+            metadata.event_id,
+            metadata.track_id,
+            metadata.zone,
+            path,
+        )
         return path
 
     def load(self, event_id: str, when: datetime) -> EventMetadata:

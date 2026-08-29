@@ -61,6 +61,20 @@ class TestEventMetadata(unittest.TestCase):
             EventMetadata.from_dict(data)
 
 
+METADATA_LOGGER = "src.storage.metadata"
+
+
+class TestSaveLogging(MetadataTestCase):
+    def test_save_logs_event_id_track_and_zone(self):
+        with self.assertLogs(METADATA_LOGGER, level="INFO") as logs:
+            self.store.save(make_metadata(event_id="evt1", track_id=3, zone="backyard"), when=WHEN)
+
+        message = logs.output[0]
+        self.assertIn("event_id=evt1", message)
+        self.assertIn("track=3", message)
+        self.assertIn("zone=backyard", message)
+
+
 class TestSave(MetadataTestCase):
     def test_writes_json_into_the_day_directory(self):
         path = self.store.save(make_metadata(), when=WHEN)
