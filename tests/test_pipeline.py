@@ -650,6 +650,89 @@ class TestPipelineWithoutADispatcher(AlertTestCase):
         self.handler.send.assert_not_called()
 
 
+class TestStageFailuresDoNotStopTheLoop(unittest.TestCase):
+    """Detector/Tracker/EventEngine exceptions are logged and swallowed per-stage."""
+
+    def test_failing_detector_skips_the_frame_without_raising(self):
+        pipeline, camera, detector, tracker, event_engine, _ = make_pipeline()
+        detector.detect.side_effect = RuntimeError("model crashed")
+
+        with self.assertLogs(PIPELINE_LOGGER, level="ERROR"):
+            tracked_objects, events = pipeline.process_frame("frame1")
+
+        tracker.update.assert_not_called()
+        event_engine.update.assert_not_called()
+        self.assertEqual(tracked_objects, [])
+        self.assertEqual(events, [])
+
+    def test_failing_tracker_skips_the_rest_of_the_frame_without_raising(self):
+        pipeline, camera, detector, tracker, event_engine, _ = make_pipeline()
+        detector.detect.return_value = ["detection"]
+        tracker.update.side_effect = RuntimeError("tracker crashed")
+
+        with self.assertLogs(PIPELINE_LOGGER, level="ERROR"):
+            tracked_objects, events = pipeline.process_frame("frame1")
+
+        event_engine.update.assert_not_called()
+        self.assertEqual(tracked_objects, [])
+        self.assertEqual(events, [])
+
+    def test_failing_event_engine_does_not_raise(self):
+        pipeline, camera, detector, tracker, event_engine, _ = make_pipeline()
+        detector.detect.return_value = ["detection"]
+        tracker.update.return_value = ["tracked"]
+        event_engine.update.side_effect = RuntimeError("event engine crashed")
+
+        with self.assertLogs(PIPELINE_LOGGER, level="ERROR"):
+            tracked_objects, events = pipeline.process_frame("frame1")
+
+        self.assertEqual(tracked_objects, ["tracked"])
+        self.assertEqual(events, [])
+
+    def test_recording_in_progress_still_gets_the_frame_when_detection_fails(self):
+        recorder = MagicMock()
+        pipeline, camera, detector, tracker, event_engine, recorder_factory = make_pipeline(
+            events_per_call=[[make_event(EVENT_PERSON_ENTERED_ZONE)]], recorders=[recorder]
+        )
+        pipeline.process_frame("frame1")
+
+        detector.detect.side_effect = RuntimeError("model crashed")
+        with self.assertLogs(PIPELINE_LOGGER, level="ERROR"):
+            pipeline.process_frame("frame2")
+
+        recorder.write.assert_has_calls([call("frame1"), call("frame2")])
+
+    def test_run_keeps_going_after_a_stage_failure(self):
+        pipeline, camera, detector, tracker, event_engine, _ = make_pipeline()
+        camera.read.side_effect = [(True, "frame1"), (True, "frame2"), (False, None)]
+        detector.detect.side_effect = [RuntimeError("boom"), []]
+
+        with self.assertLogs(PIPELINE_LOGGER, level="ERROR"):
+            pipeline.run()  # should not raise
+
+        self.assertEqual(detector.detect.call_count, 2)
+
+
+class TestActiveRecordingWriteFailures(unittest.TestCase):
+    def test_a_failing_write_does_not_raise_and_other_recordings_still_get_the_frame(self):
+        broken_recorder = MagicMock()
+        broken_recorder.write.side_effect = RecorderError("disk full")
+        healthy_recorder = MagicMock()
+        events = [
+            make_event(EVENT_PERSON_ENTERED_ZONE, track_id=1, zone="front_door"),
+            make_event(EVENT_PERSON_ENTERED_ZONE, track_id=2, zone="backyard"),
+        ]
+        pipeline, *_rest = make_pipeline(
+            events_per_call=[events, []], recorders=[broken_recorder, healthy_recorder]
+        )
+        pipeline.process_frame("frame1")
+
+        with self.assertLogs(PIPELINE_LOGGER, level="ERROR"):
+            pipeline.process_frame("frame2")  # should not raise
+
+        healthy_recorder.write.assert_called_with("frame2")
+
+
 class TestAlertFailuresDoNotStopTheLoop(AlertTestCase):
     """Alerting is best-effort: recording and metadata must survive it failing."""
 

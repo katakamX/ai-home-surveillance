@@ -112,21 +112,55 @@ class SurveillancePipeline:
         Order per frame: detect -> track -> event_engine.update -> react to any
         enter/exit events -> write the frame to every recording still active
         (including one just started this frame).
+
+        Each stage is isolated: if detection, tracking or the event engine
+        raises, the failure is logged and this frame is skipped for that stage
+        onward, but recordings already in progress still get their frame and
+        the loop keeps running.
         """
         if timestamp is None:
             timestamp = time.time()
 
-        detections = self.detector.detect(frame)
-        tracked_objects = self.tracker.update(detections)
-        events = self.event_engine.update(tracked_objects, timestamp)
+        tracked_objects: list[TrackedObject] = []
+        events: list[Event] = []
 
-        for event in events:
-            self._handle_event(event, frame)
+        detections = self._run_stage("Detector", self.detector.detect, frame)
+        if detections is not None:
+            stage_result = self._run_stage("Tracker", self.tracker.update, detections)
+            if stage_result is not None:
+                tracked_objects = stage_result
+                stage_result = self._run_stage(
+                    "EventEngine", self.event_engine.update, tracked_objects, timestamp
+                )
+                if stage_result is not None:
+                    events = stage_result
+                    for event in events:
+                        self._handle_event(event, frame)
 
-        for recording in self._recordings.values():
-            recording.recorder.write(frame)
+        self._write_active_recordings(frame)
 
         return tracked_objects, events
+
+    def _run_stage(self, name: str, func: Callable, *args: Any) -> Any:
+        """Call one pipeline stage, returning None (and logging) if it raises.
+
+        This is the only place that decides a bad detector/tracker/event
+        engine cannot bring surveillance down; the modules themselves stay
+        unaware of it.
+        """
+        try:
+            return func(*args)
+        except Exception:
+            logger.exception("%s failed; skipping this frame", name)
+            return None
+
+    def _write_active_recordings(self, frame: Frame) -> None:
+        """Write frame to every recording still active, isolating each one."""
+        for key, recording in self._recordings.items():
+            try:
+                recording.recorder.write(frame)
+            except RecorderError:
+                logger.exception("Could not write frame for track=%s zone=%s", key[0], key[1])
 
     def run(self, max_frames: Optional[int] = None) -> None:
         """Read frames from the camera and process them until it runs dry.
