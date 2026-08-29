@@ -1,4 +1,4 @@
-"""Read-only HTTP API over the stored surveillance events.
+"""Read-only HTTP API over the stored surveillance events, plus the dashboard.
 
 Nothing here records, detects or deletes: it only reads what the pipeline
 already wrote, through the existing MetadataStore and StorageManager. That
@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 
 from src.config.settings import load_settings
 from src.storage.metadata import EventMetadata, MetadataStore
@@ -31,6 +31,10 @@ logger = logging.getLogger(__name__)
 
 SNAPSHOT_MEDIA_TYPE = "image/jpeg"
 VIDEO_MEDIA_TYPE = "video/mp4"
+
+# The dashboard page. One self-contained HTML file with its own CSS and
+# vanilla JS: it reads the endpoints below and has no build step.
+DASHBOARD_FILE = Path(__file__).resolve().parent / "static" / "index.html"
 
 
 def default_metadata_store() -> MetadataStore:
@@ -68,6 +72,14 @@ def create_app(metadata_store: Optional[MetadataStore] = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=f"The {description} file is missing")
 
         return FileResponse(path, media_type=media_type, filename=path.name)
+
+    @api.get("/", response_class=HTMLResponse)
+    def dashboard() -> HTMLResponse:
+        """The browser dashboard. It fetches its data from /events."""
+        if not DASHBOARD_FILE.is_file():
+            raise HTTPException(status_code=404, detail="Dashboard page is not installed")
+
+        return HTMLResponse(DASHBOARD_FILE.read_text(encoding="utf-8"))
 
     @api.get("/health")
     def health() -> dict:

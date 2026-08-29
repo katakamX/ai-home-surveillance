@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AI Home Surveillance</title>
+    <style>
+      :root {
+        --bg: #14171c;
+        --card: #1e232b;
+        --line: #2c333d;
+        --text: #e8ecf1;
+        --muted: #93a0b0;
+        --accent: #4da3ff;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        padding: 24px;
+        background: var(--bg);
+        color: var(--text);
+        font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+        line-height: 1.5;
+      }
+
+      header {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        align-items: baseline;
+        justify-content: space-between;
+        margin-bottom: 20px;
+      }
+
+      h1 { font-size: 1.4rem; margin: 0; }
+
+      #summary { color: var(--muted); font-size: 0.9rem; }
+
+      #events {
+        display: grid;
+        gap: 16px;
+        grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      }
+
+      .event {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        overflow: hidden;
+      }
+
+      .event img {
+        display: block;
+        width: 100%;
+        aspect-ratio: 4 / 3;
+        object-fit: cover;
+        background: #0d1015;
+      }
+
+      .no-snapshot {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        aspect-ratio: 4 / 3;
+        background: #0d1015;
+        color: var(--muted);
+        font-size: 0.85rem;
+      }
+
+      .body { padding: 12px 14px 14px; }
+
+      .event-type { font-weight: 600; margin-bottom: 2px; }
+
+      .when { color: var(--muted); font-size: 0.85rem; margin-bottom: 10px; }
+
+      dl {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 2px 10px;
+        margin: 0 0 12px;
+        font-size: 0.9rem;
+      }
+
+      dt { color: var(--muted); }
+      dd { margin: 0; }
+
+      a.video {
+        display: inline-block;
+        color: var(--accent);
+        text-decoration: none;
+        font-size: 0.9rem;
+      }
+
+      a.video:hover { text-decoration: underline; }
+
+      .no-video { color: var(--muted); font-size: 0.9rem; }
+
+      #message {
+        color: var(--muted);
+        padding: 40px 0;
+        text-align: center;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>AI Home Surveillance</h1>
+      <div id="summary"></div>
+    </header>
+
+    <p id="message">Loading events…</p>
+    <div id="events"></div>
+
+    <script>
+      // Everything below reads the existing read-only API. The dashboard never
+      // touches the filesystem itself.
+      const eventsEl = document.getElementById("events");
+      const messageEl = document.getElementById("message");
+      const summaryEl = document.getElementById("summary");
+
+      function formatTime(timestamp) {
+        return new Date(timestamp * 1000).toLocaleString();
+      }
+
+      function formatDuration(seconds) {
+        if (seconds === null || seconds === undefined) return "unknown";
+        return `${seconds.toFixed(1)}s`;
+      }
+
+      function formatConfidence(confidence) {
+        return `${(confidence * 100).toFixed(0)}%`;
+      }
+
+      function buildEventCard(event) {
+        const card = document.createElement("article");
+        card.className = "event";
+
+        // A snapshot may be missing, or may 404 if the file was cleaned up.
+        if (event.snapshot_path) {
+          const img = document.createElement("img");
+          img.src = `/events/${encodeURIComponent(event.event_id)}/snapshot`;
+          img.alt = `Snapshot of ${event.event_type} in ${event.zone}`;
+          img.onerror = () => img.replaceWith(placeholder("Snapshot unavailable"));
+          card.appendChild(img);
+        } else {
+          card.appendChild(placeholder("No snapshot"));
+        }
+
+        const body = document.createElement("div");
+        body.className = "body";
+        body.appendChild(textEl("div", "event-type", event.event_type));
+        body.appendChild(textEl("div", "when", formatTime(event.timestamp)));
+
+        const list = document.createElement("dl");
+        addRow(list, "Zone", event.zone);
+        addRow(list, "Track", String(event.track_id));
+        addRow(list, "Confidence", formatConfidence(event.confidence));
+        addRow(list, "Duration", formatDuration(event.duration));
+        body.appendChild(list);
+
+        if (event.video_path) {
+          const link = document.createElement("a");
+          link.className = "video";
+          link.href = `/events/${encodeURIComponent(event.event_id)}/video`;
+          link.textContent = "▶ Watch video";
+          body.appendChild(link);
+        } else {
+          body.appendChild(textEl("span", "no-video", "No video recorded"));
+        }
+
+        card.appendChild(body);
+        return card;
+      }
+
+      function placeholder(text) {
+        return textEl("div", "no-snapshot", text);
+      }
+
+      function textEl(tag, className, text) {
+        const el = document.createElement(tag);
+        el.className = className;
+        el.textContent = text;
+        return el;
+      }
+
+      function addRow(list, label, value) {
+        list.appendChild(textEl("dt", "", label));
+        list.appendChild(textEl("dd", "", value));
+      }
+
+      async function loadEvents() {
+        try {
+          const response = await fetch("/events?limit=50");
+          if (!response.ok) throw new Error(`API returned ${response.status}`);
+
+          const events = await response.json();
+          eventsEl.replaceChildren(...events.map(buildEventCard));
+
+          if (events.length === 0) {
+            messageEl.textContent = "No events recorded yet.";
+          } else {
+            messageEl.hidden = true;
+          }
+
+          summaryEl.textContent = `${events.length} event${
+            events.length === 1 ? "" : "s"
+          }, newest first`;
+        } catch (error) {
+          messageEl.hidden = false;
+          messageEl.textContent = `Could not load events: ${error.message}`;
+        }
+      }
+
+      loadEvents();
+    </script>
+  </body>
+</html>
