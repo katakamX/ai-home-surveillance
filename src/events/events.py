@@ -62,11 +62,14 @@ class EventEngine:
     produces exactly one exit event.
 
     Entering is reported immediately, but leaving must be confirmed by
-    exit_frames consecutive frames outside the zone. That hysteresis absorbs
-    the few-pixel box wobble at the zone edge that would otherwise produce
-    rapid false enter/exit pairs. A track that vanishes from tracked_objects
-    exits at once: the tracker upstream already tolerates missed frames, so an
-    absent track really is gone.
+    exit_frames consecutive frames of not being inside the zone. That
+    hysteresis absorbs the few-pixel box wobble at the zone edge that would
+    otherwise produce rapid false enter/exit pairs, and it applies just as much
+    to a track that is missing from the frame altogether: the detector drops a
+    marginally-visible person for a burst of frames at a time, and treating
+    that as an immediate departure is what produced storms of false
+    enter/exit pairs on a real camera. A person who is really gone stays
+    un-seen, so the countdown runs out and they get exactly one exit.
     """
 
     def __init__(self, zones: list[Zone], exit_frames: int = DEFAULT_EXIT_FRAMES) -> None:
@@ -82,10 +85,8 @@ class EventEngine:
     def update(self, tracked_objects: list[TrackedObject], timestamp: float) -> list[Event]:
         events: list[Event] = []
         inside_now: set[tuple[int, str]] = set()
-        present_tracks: set[int] = set()
 
         for tracked in tracked_objects:
-            present_tracks.add(tracked.track_id)
             self._last_seen[tracked.track_id] = (tracked.label, tracked.confidence)
             point = _center(tracked.box)
             for zone in self.zones:
@@ -106,12 +107,16 @@ class EventEngine:
 
         for key in sorted(self._occupied - inside_now):
             track_id, zone_name = key
-            if track_id in present_tracks:
-                # Still on screen, just outside the zone: wait for the wobble
-                # to settle before calling it an exit.
-                self._frames_outside[key] = self._frames_outside.get(key, 0) + 1
-                if self._frames_outside[key] < self.exit_frames:
-                    continue
+            # An occupied pair can stop being inside for two reasons: the person
+            # is still on screen but stepped outside, or the track is missing
+            # from this frame entirely. For a frame or two those look identical
+            # and both settle on their own -- edge wobble on one side, a
+            # detector dropout on the other -- so both wait out exit_frames
+            # before an exit is reported. Exiting an absent track at once is
+            # what turned every brief dropout into a false exit/enter pair.
+            self._frames_outside[key] = self._frames_outside.get(key, 0) + 1
+            if self._frames_outside[key] < self.exit_frames:
+                continue
 
             self._occupied.discard(key)
             self._frames_outside.pop(key, None)

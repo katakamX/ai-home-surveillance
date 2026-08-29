@@ -12,7 +12,17 @@ from src.detection.detector import Detection
 
 # A track that goes unmatched for more than this many consecutive frames is
 # dropped, so a person who leaves the frame does not linger forever.
-DEFAULT_MAX_MISSED_FRAMES = 5
+#
+# Sized from real webcam measurements rather than picked by feel. A person the
+# detector only marginally sees (YOLO confidence sitting near the threshold)
+# is not lost once: the detections drop out in bursts. In a measured marginal
+# run, bursts of up to 12 frames covered ~95% of all dropouts, and at the
+# ~12 FPS this pipeline reaches on a laptop CPU that is roughly one second:
+# long enough to ride out the flicker, short enough that somebody who really
+# walked away is not held on to. The old value of 5 was under half of that, so
+# a single burst ended the track, the next detection became a *new* track_id,
+# and every flicker turned into a spurious exit/enter pair downstream.
+DEFAULT_MAX_MISSED_FRAMES = 12
 
 # Boxes must overlap by at least this fraction to be considered the same
 # object from one frame to the next.

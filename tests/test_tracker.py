@@ -66,6 +66,20 @@ class TestTrackerContinuity(unittest.TestCase):
 
         self.assertEqual(len(result), 1)
 
+    def test_track_survives_a_burst_of_missed_frames(self):
+        # A real detector loses a marginally-visible person for several frames
+        # in a row, not just one, so the default persistence has to cover a
+        # burst rather than a single blink.
+        tracker = Tracker()
+        first = tracker.update([person((0, 0, 10, 10))])
+
+        for _ in range(6):
+            tracker.update([])
+        result = tracker.update([person((1, 1, 11, 11))])
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].track_id, first[0].track_id)
+
     def test_track_is_dropped_after_too_many_missed_frames(self):
         tracker = Tracker(max_missed_frames=1)
         tracker.update([person((0, 0, 10, 10))])

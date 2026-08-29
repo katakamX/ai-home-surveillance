@@ -101,29 +101,34 @@ class TestExitEvents(unittest.TestCase):
         self.assertEqual(engine.update([outside_all_zones()], timestamp=3.0), [])
 
     def test_disappearing_from_the_frame_counts_as_an_exit(self):
-        engine = EventEngine([DOOR])
+        # Staying away is what makes it a departure: one missing frame alone is
+        # a detector dropout, so the countdown has to run out first.
+        engine = EventEngine([DOOR], exit_frames=2)
         engine.update([inside_door()], timestamp=1.0)
 
-        events = engine.update([], timestamp=2.0)
+        engine.update([], timestamp=2.0)
+        events = engine.update([], timestamp=3.0)
 
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].event_type, EVENT_PERSON_EXITED_ZONE)
 
     def test_exit_event_keeps_the_last_seen_label_and_confidence(self):
-        engine = EventEngine([DOOR])
+        engine = EventEngine([DOOR], exit_frames=2)
         engine.update([inside_door(confidence=0.77)], timestamp=1.0)
 
-        events = engine.update([], timestamp=2.0)
+        engine.update([], timestamp=2.0)
+        events = engine.update([], timestamp=3.0)
 
         self.assertEqual(events[0].label, "person")
         self.assertEqual(events[0].confidence, 0.77)
 
     def test_re_entering_generates_a_new_enter_event(self):
-        engine = EventEngine([DOOR])
+        engine = EventEngine([DOOR], exit_frames=2)
         engine.update([inside_door()], timestamp=1.0)
         engine.update([], timestamp=2.0)
+        engine.update([], timestamp=3.0)  # exit confirmed here
 
-        events = engine.update([inside_door()], timestamp=3.0)
+        events = engine.update([inside_door()], timestamp=4.0)
 
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].event_type, EVENT_PERSON_ENTERED_ZONE)
@@ -190,14 +195,71 @@ class TestBoundaryJitter(unittest.TestCase):
 
         self.assertEqual(events, [])
 
-    def test_track_disappearing_exits_immediately_without_waiting(self):
+    def test_track_disappearing_does_not_exit_immediately(self):
+        # The counterpart of the wobble above, and the more damaging of the two:
+        # a detector that loses a marginally-visible person for a frame looks
+        # exactly like a departure, and exiting at once turned every dropout
+        # into a false visit on the real camera.
         engine = EventEngine([DOOR], exit_frames=10)
         engine.update([inside_door()], timestamp=1.0)
 
         events = engine.update([], timestamp=1.03)
 
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0].event_type, EVENT_PERSON_EXITED_ZONE)
+        self.assertEqual(events, [])
+
+
+class TestMissingTrackHysteresis(unittest.TestCase):
+    """A track missing from the frame is treated as a dropout until proven a
+    departure, so it waits out the same countdown as one that stepped outside.
+    """
+
+    def test_an_absence_shorter_than_the_countdown_emits_nothing(self):
+        engine = EventEngine([DOOR], exit_frames=4)
+        engine.update([inside_door()], timestamp=1.0)
+
+        events = [engine.update([], timestamp=1.0 + n) for n in (1, 2, 3)]
+
+        self.assertEqual(events, [[], [], []])
+
+    def test_returning_before_the_countdown_expires_emits_nothing_at_all(self):
+        engine = EventEngine([DOOR], exit_frames=4)
+        engine.update([inside_door()], timestamp=1.0)
+        engine.update([], timestamp=2.0)
+        engine.update([], timestamp=3.0)
+
+        # Back again, same track: this is one continuous visit, not a new one.
+        events = engine.update([inside_door()], timestamp=4.0)
+
+        self.assertEqual(events, [])
+
+    def test_returning_resets_the_countdown(self):
+        engine = EventEngine([DOOR], exit_frames=3)
+        engine.update([inside_door()], timestamp=1.0)
+        engine.update([], timestamp=2.0)
+        engine.update([], timestamp=3.0)
+        engine.update([inside_door()], timestamp=4.0)  # countdown resets here
+
+        events = [engine.update([], timestamp=4.0 + n) for n in (1, 2)]
+
+        self.assertEqual(events, [[], []])
+
+    def test_a_sustained_absence_emits_exactly_one_exit(self):
+        engine = EventEngine([DOOR], exit_frames=3)
+        engine.update([inside_door()], timestamp=1.0)
+
+        emitted = [engine.update([], timestamp=1.0 + n) for n in range(1, 8)]
+        exits = [event for events in emitted for event in events]
+
+        self.assertEqual(len(exits), 1)
+        self.assertEqual(exits[0].event_type, EVENT_PERSON_EXITED_ZONE)
+
+    def test_the_exit_lands_on_the_frame_the_countdown_runs_out(self):
+        engine = EventEngine([DOOR], exit_frames=3)
+        engine.update([inside_door()], timestamp=1.0)
+
+        self.assertEqual(engine.update([], timestamp=2.0), [])
+        self.assertEqual(engine.update([], timestamp=3.0), [])
+        self.assertEqual(len(engine.update([], timestamp=4.0)), 1)
 
 
 class TestMultipleZonesAndPeople(unittest.TestCase):

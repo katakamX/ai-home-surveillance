@@ -24,7 +24,13 @@ except ImportError:  # OpenCV/numpy missing: these tests need real file writing.
     cv2 = None
     numpy = None
 
-from src.events.events import EVENT_PERSON_ENTERED_ZONE, EVENT_PERSON_EXITED_ZONE, EventEngine, Zone
+from src.events.events import (
+    DEFAULT_EXIT_FRAMES,
+    EVENT_PERSON_ENTERED_ZONE,
+    EVENT_PERSON_EXITED_ZONE,
+    EventEngine,
+    Zone,
+)
 from src.pipeline.pipeline import SurveillancePipeline
 from src.storage.metadata import MetadataStore
 from src.storage.recorder import VideoRecorder
@@ -104,11 +110,17 @@ class EndToEndTestCase(unittest.TestCase):
         events = []
         _, enter_events = self.feed([tracked_person()], seconds=0.0)
         events += enter_events
-        for index, offset in enumerate((1.0, 2.0), start=1):
+        for offset in (1.0, 2.0):
             self.feed([tracked_person()], seconds=offset)
-        # The track disappears entirely, so EventEngine reports the exit at once.
-        _, exit_events = self.feed([], seconds=5.0)
-        events += exit_events
+
+        # The track disappears. That is not an instant exit: a vanished track
+        # is a detector dropout until it stays gone for exit_frames frames, so
+        # the absence has to be sustained for the visit to end. Those in-between
+        # frames still belong to the visit and are still recorded, because until
+        # the countdown runs out the person may simply have been missed.
+        for index in range(DEFAULT_EXIT_FRAMES):
+            _, exit_events = self.feed([], seconds=3.0 + index)
+            events += exit_events
         return events
 
 
@@ -133,8 +145,11 @@ class TestFullVisitProducesFiles(EndToEndTestCase):
     def test_every_frame_of_the_visit_is_written(self):
         self.run_full_visit()
 
-        # Frames at 0.0, 1.0 and 2.0 are written; the frame carrying the exit is not.
-        self.assertEqual(self.recorders[0].write.call_count, 3)
+        # The three frames the person was visible for, plus the frames while the
+        # engine was still waiting to see whether they had really gone. Only the
+        # frame that carries the exit is left out, because the recording is
+        # stopped before that frame is written.
+        self.assertEqual(self.recorders[0].write.call_count, 3 + DEFAULT_EXIT_FRAMES - 1)
 
     def test_a_real_mp4_and_jpg_land_in_the_day_directory(self):
         self.run_full_visit()
@@ -199,7 +214,9 @@ class TestMetadataForACompletedVisit(EndToEndTestCase):
     def test_duration_is_the_time_between_enter_and_exit(self):
         record = self.store.load(str(self.enter_event.event_id), START_TIME)
 
-        self.assertAlmostEqual(record.duration, 5.0)
+        # Entered at 0.0; the exit lands on the frame the countdown runs out,
+        # which run_full_visit feeds at 3.0 + (DEFAULT_EXIT_FRAMES - 1).
+        self.assertAlmostEqual(record.duration, 3.0 + DEFAULT_EXIT_FRAMES - 1)
 
     def test_recorded_video_path_points_at_the_real_clip(self):
         record = self.store.load(str(self.enter_event.event_id), START_TIME)
@@ -268,9 +285,10 @@ class TestNoDuplicateRecordings(EndToEndTestCase):
         self.recorders[0].start.assert_called_once_with()
 
     def test_leaving_and_returning_starts_a_second_recording(self):
-        self.run_full_visit()
-        self.feed([tracked_person()], seconds=6.0)
-        self.feed([], seconds=7.0)
+        self.run_full_visit()  # first visit ends at 3.0 + DEFAULT_EXIT_FRAMES - 1
+        self.feed([tracked_person()], seconds=20.0)
+        for index in range(DEFAULT_EXIT_FRAMES):
+            self.feed([], seconds=21.0 + index)
 
         self.assertEqual(len(self.recorders), 2)
         self.assertEqual(len(list(self.day_dir.glob("*.mp4"))), 2)
@@ -279,15 +297,15 @@ class TestNoDuplicateRecordings(EndToEndTestCase):
 
 class TestPipelineRunLoop(EndToEndTestCase):
     def test_run_drives_a_whole_visit_from_the_camera(self):
-        frames = [(True, make_frame()) for _ in range(4)] + [(False, None)]
+        present_frames = 3
+        total = present_frames + DEFAULT_EXIT_FRAMES
+        frames = [(True, make_frame()) for _ in range(total)] + [(False, None)]
         self.camera.read.side_effect = frames
-        # Person present for the first three frames, gone for the fourth.
-        self.tracker.update.side_effect = [
-            [tracked_person()],
-            [tracked_person()],
-            [tracked_person()],
-            [],
-        ]
+        # Person present for the first three frames, then gone for long enough
+        # that the engine stops treating it as a dropout and reports the exit.
+        self.tracker.update.side_effect = (
+            [[tracked_person()]] * present_frames + [[]] * DEFAULT_EXIT_FRAMES
+        )
 
         self.pipeline.run()
 
