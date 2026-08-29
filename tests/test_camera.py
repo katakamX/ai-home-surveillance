@@ -130,6 +130,120 @@ class TestCameraRead(unittest.TestCase):
         capture.read.assert_not_called()
 
 
+class TestCameraReadFailures(unittest.TestCase):
+    @patch("src.camera.camera.cv2")
+    def test_read_raising_is_reported_as_failure_not_an_exception(self, cv2):
+        capture = make_capture()
+        capture.read.side_effect = RuntimeError("device disconnected")
+        cv2.VideoCapture.return_value = capture
+
+        camera = Camera(0)
+
+        self.assertEqual(camera.read(), (False, None))
+
+    @patch("src.camera.camera.cv2")
+    def test_repeated_read_failures_do_not_raise(self, cv2):
+        cv2.VideoCapture.return_value = make_capture(read_result=(False, None))
+
+        camera = Camera(0)
+
+        for _ in range(5):
+            self.assertEqual(camera.read(), (False, None))
+
+
+class TestCameraReconnect(unittest.TestCase):
+    @patch("src.camera.camera.time.sleep")
+    @patch("src.camera.camera.cv2")
+    def test_reconnect_succeeds_on_first_attempt(self, cv2, sleep):
+        cv2.VideoCapture.return_value = make_capture()
+
+        camera = Camera(0)
+        self.assertTrue(camera.reconnect())
+        self.assertTrue(camera.is_opened())
+        sleep.assert_not_called()
+
+    @patch("src.camera.camera.time.sleep")
+    @patch("src.camera.camera.cv2")
+    def test_reconnect_succeeds_after_earlier_failures(self, cv2, sleep):
+        failing = make_capture(is_opened=False)
+        working = make_capture()
+        cv2.VideoCapture.side_effect = [make_capture(), failing, failing, working]
+
+        camera = Camera(0, max_reconnect_attempts=3, reconnect_delay_seconds=5)
+
+        self.assertTrue(camera.reconnect())
+        self.assertTrue(camera.is_opened())
+        self.assertEqual(sleep.call_count, 2)
+        sleep.assert_called_with(5)
+
+    @patch("src.camera.camera.time.sleep")
+    @patch("src.camera.camera.cv2")
+    def test_reconnect_fails_after_exhausting_attempts(self, cv2, sleep):
+        failing = make_capture(is_opened=False)
+        cv2.VideoCapture.side_effect = [make_capture(), failing, failing, failing]
+
+        camera = Camera(0, max_reconnect_attempts=3, reconnect_delay_seconds=1)
+
+        self.assertFalse(camera.reconnect())
+        self.assertFalse(camera.is_opened())
+        self.assertEqual(sleep.call_count, 2)  # no pause after the last attempt
+
+    @patch("src.camera.camera.time.sleep")
+    @patch("src.camera.camera.cv2")
+    def test_reconnect_never_sleeps_in_tests(self, cv2, sleep):
+        # The delay is only ever passed to the mocked time.sleep; nothing here
+        # actually waits, so the test suite stays fast and deterministic.
+        failing = make_capture(is_opened=False)
+        cv2.VideoCapture.side_effect = [make_capture(), failing, failing]
+
+        camera = Camera(0, max_reconnect_attempts=2, reconnect_delay_seconds=999)
+
+        self.assertFalse(camera.reconnect())
+        sleep.assert_called_once_with(999)
+
+    @patch("src.camera.camera.cv2")
+    def test_reconnect_releases_the_old_capture_first(self, cv2):
+        old_capture = make_capture()
+        new_capture = make_capture()
+        cv2.VideoCapture.side_effect = [old_capture, new_capture]
+
+        camera = Camera(0, max_reconnect_attempts=1)
+        camera.reconnect()
+
+        old_capture.release.assert_called_once()
+
+    @patch("src.camera.camera.cv2")
+    def test_read_after_failed_reconnect_returns_failure(self, cv2):
+        failing = make_capture(is_opened=False)
+        cv2.VideoCapture.side_effect = [make_capture(), failing]
+
+        camera = Camera(0, max_reconnect_attempts=1)
+        camera.reconnect()
+
+        self.assertEqual(camera.read(), (False, None))
+
+    @patch("src.camera.camera.cv2")
+    def test_release_after_failed_reconnect_is_safe(self, cv2):
+        failing = make_capture(is_opened=False)
+        cv2.VideoCapture.side_effect = [make_capture(), failing]
+
+        camera = Camera(0, max_reconnect_attempts=1)
+        camera.reconnect()
+
+        camera.release()  # should not raise even though capture is already None
+        camera.release()
+
+    @patch("src.camera.camera.cv2")
+    def test_reconnect_can_recover_and_be_released_normally(self, cv2):
+        cv2.VideoCapture.side_effect = [make_capture(), make_capture()]
+
+        camera = Camera(0, max_reconnect_attempts=1)
+        camera.reconnect()
+        camera.release()
+
+        self.assertFalse(camera.is_opened())
+
+
 class TestCameraRelease(unittest.TestCase):
     @patch("src.camera.camera.cv2")
     def test_release_closes_the_device(self, cv2):
